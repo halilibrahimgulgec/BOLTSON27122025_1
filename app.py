@@ -13,8 +13,37 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+import hashlib
+import json
+import urllib.request
 
 load_dotenv()
+
+# Helper functions for data upload
+def create_record_hash(record: dict) -> str:
+    """Kayıt için benzersiz hash oluştur (duplicate kontrolü için)"""
+    key_parts = []
+    for key in sorted(record.keys()):
+        if record[key] is not None:
+            key_parts.append(f"{key}:{record[key]}")
+    hash_string = '|'.join(key_parts)
+    return hashlib.md5(hash_string.encode()).hexdigest()
+
+def get_existing_hashes(table: str) -> set:
+    """Tablodaki mevcut kayıtların hash'lerini al"""
+    try:
+        from database import SUPABASE_URL, SUPABASE_KEY
+        url = f'{SUPABASE_URL}/rest/v1/{table}?select=record_hash'
+
+        req = urllib.request.Request(url, method='GET')
+        req.add_header('apikey', SUPABASE_KEY)
+        req.add_header('Authorization', f'Bearer {SUPABASE_KEY}')
+
+        with urllib.request.urlopen(req) as response:
+            data = json.loads(response.read().decode())
+            return {row.get('record_hash') for row in data if row.get('record_hash')}
+    except:
+        return set()
 
 app = Flask(__name__)
 CORS(app)
@@ -77,6 +106,182 @@ def index():
 def muhasebe():
     """Muhasebe sayfası"""
     return render_template('muhasebe.html')
+
+@app.route('/veri_yukleme')
+def veri_yukleme():
+    """Veri yükleme sayfası"""
+    return render_template('veri_yukleme.html')
+
+@app.route('/api/database-stats')
+def api_database_stats():
+    """Veritabanı istatistiklerini döndür"""
+    try:
+        from database import get_database_info, get_statistics
+        db_info = get_database_info()
+        stats = get_statistics()
+
+        return jsonify({
+            'yakit_count': db_info.get('yakit_count', 0),
+            'agirlik_count': db_info.get('agirlik_count', 0),
+            'arac_takip_count': db_info.get('arac_takip_count', 0),
+            'plaka_sayisi': stats.get('plaka_sayisi', 0),
+            'total_records': db_info.get('total_records', 0)
+        })
+    except Exception as e:
+        logger.error(f"Database stats error: {e}")
+        return jsonify({
+            'yakit_count': 0,
+            'agirlik_count': 0,
+            'arac_takip_count': 0,
+            'plaka_sayisi': 0,
+            'total_records': 0
+        })
+
+@app.route('/api/upload-excel', methods=['POST'])
+def api_upload_excel():
+    """Excel dosyası yükle"""
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': 'Dosya bulunamadı'}), 400
+
+        file = request.files['file']
+        file_type = request.form.get('type', '')
+
+        if file.filename == '':
+            return jsonify({'error': 'Dosya seçilmedi'}), 400
+
+        if not file.filename.endswith(('.xlsx', '.xls')):
+            return jsonify({'error': 'Sadece Excel dosyaları (.xlsx, .xls) desteklenir'}), 400
+
+        # Excel dosyasını oku
+        df = pd.read_excel(file)
+        df.columns = df.columns.str.strip().str.lower()
+
+        total = len(df)
+        inserted = 0
+        duplicates = 0
+
+        # Dosya tipine göre işle
+        if file_type == 'yakit':
+            from database import supabase_insert_batch
+            import hashlib
+            import json
+
+            # Mevcut hash'leri al
+            existing_hashes = get_existing_hashes('yakit')
+
+            records = []
+            for _, row in df.iterrows():
+                record = {
+                    'plaka': str(row.get('plaka', '')).strip() if pd.notna(row.get('plaka')) else None,
+                    'islem_tarihi': str(row.get('islem_tarihi', '')) if pd.notna(row.get('islem_tarihi')) else None,
+                    'saat': str(row.get('saat', '')) if pd.notna(row.get('saat')) else None,
+                    'yakit_miktari': float(row.get('yakit_miktari', 0)) if pd.notna(row.get('yakit_miktari')) else None,
+                    'birim_fiyat': float(row.get('birim_fiyat', 0)) if pd.notna(row.get('birim_fiyat')) else None,
+                    'satir_tutari': float(row.get('satir_tutari', 0)) if pd.notna(row.get('satir_tutari')) else None,
+                    'stok_adi': str(row.get('stok_adi', '')) if pd.notna(row.get('stok_adi')) else None,
+                    'km_bilgisi': float(row.get('km_bilgisi', 0)) if pd.notna(row.get('km_bilgisi')) else None
+                }
+
+                record_hash = create_record_hash(record)
+                if record_hash in existing_hashes:
+                    duplicates += 1
+                    continue
+
+                record['record_hash'] = record_hash
+                records.append(record)
+
+            # Batch insert
+            batch_size = 1000
+            for i in range(0, len(records), batch_size):
+                batch = records[i:i+batch_size]
+                if supabase_insert_batch('yakit', batch):
+                    inserted += len(batch)
+
+        elif file_type == 'agirlik':
+            from database import supabase_insert_batch
+
+            existing_hashes = get_existing_hashes('agirlik')
+
+            records = []
+            for _, row in df.iterrows():
+                record = {
+                    'tarih': str(row.get('tarih', '')) if pd.notna(row.get('tarih')) else None,
+                    'miktar': float(row.get('miktar', 0)) if pd.notna(row.get('miktar')) else None,
+                    'birim': str(row.get('birim', '')) if pd.notna(row.get('birim')) else None,
+                    'net_agirlik': float(row.get('net_agirlik', 0)) if pd.notna(row.get('net_agirlik')) else None,
+                    'plaka': str(row.get('plaka', '')).strip() if pd.notna(row.get('plaka')) else None,
+                    'adres': str(row.get('adres', '')) if pd.notna(row.get('adres')) else None,
+                    'islem_noktasi': str(row.get('islem_noktasi', '')) if pd.notna(row.get('islem_noktasi')) else None,
+                    'cari_adi': str(row.get('cari_adi', '')) if pd.notna(row.get('cari_adi')) else None
+                }
+
+                record_hash = create_record_hash(record)
+                if record_hash in existing_hashes:
+                    duplicates += 1
+                    continue
+
+                record['record_hash'] = record_hash
+                records.append(record)
+
+            batch_size = 1000
+            for i in range(0, len(records), batch_size):
+                batch = records[i:i+batch_size]
+                if supabase_insert_batch('agirlik', batch):
+                    inserted += len(batch)
+
+        elif file_type == 'arac-takip':
+            from database import supabase_insert_batch
+
+            existing_hashes = get_existing_hashes('arac_takip')
+
+            records = []
+            for _, row in df.iterrows():
+                record = {
+                    'plaka': str(row.get('plaka', '')).strip() if pd.notna(row.get('plaka')) else None,
+                    'sofor_adi': str(row.get('sofor_adi', '')) if pd.notna(row.get('sofor_adi')) else None,
+                    'arac_gruplari': str(row.get('arac_gruplari', '')) if pd.notna(row.get('arac_gruplari')) else None,
+                    'tarih': str(row.get('tarih', '')) if pd.notna(row.get('tarih')) else None,
+                    'hareket_baslangic_tarihi': str(row.get('hareket_baslangic_tarihi', '')) if pd.notna(row.get('hareket_baslangic_tarihi')) else None,
+                    'hareket_bitis_tarihi': str(row.get('hareket_bitis_tarihi', '')) if pd.notna(row.get('hareket_bitis_tarihi')) else None,
+                    'baslangic_adresi': str(row.get('baslangic_adresi', '')) if pd.notna(row.get('baslangic_adresi')) else None,
+                    'bitis_adresi': str(row.get('bitis_adresi', '')) if pd.notna(row.get('bitis_adresi')) else None,
+                    'toplam_kilometre': float(row.get('toplam_kilometre', 0)) if pd.notna(row.get('toplam_kilometre')) else None,
+                    'hareket_suresi': str(row.get('hareket_suresi', '')) if pd.notna(row.get('hareket_suresi')) else None,
+                    'rolanti_suresi': str(row.get('rolanti_suresi', '')) if pd.notna(row.get('rolanti_suresi')) else None,
+                    'park_suresi': str(row.get('park_suresi', '')) if pd.notna(row.get('park_suresi')) else None,
+                    'gunluk_yakit_tuketimi_l': float(row.get('gunluk_yakit_tuketimi_l', 0)) if pd.notna(row.get('gunluk_yakit_tuketimi_l')) else None
+                }
+
+                record_hash = create_record_hash(record)
+                if record_hash in existing_hashes:
+                    duplicates += 1
+                    continue
+
+                record['record_hash'] = record_hash
+                records.append(record)
+
+            batch_size = 1000
+            for i in range(0, len(records), batch_size):
+                batch = records[i:i+batch_size]
+                if supabase_insert_batch('arac_takip', batch):
+                    inserted += len(batch)
+
+        else:
+            return jsonify({'error': 'Geçersiz dosya tipi'}), 400
+
+        return jsonify({
+            'success': True,
+            'inserted': inserted,
+            'duplicates': duplicates,
+            'total': total
+        })
+
+    except Exception as e:
+        logger.error(f"Upload error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/plakalar')
 def api_plakalar():
